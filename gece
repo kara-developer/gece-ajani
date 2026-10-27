@@ -1,0 +1,536 @@
+#!/usr/bin/env python3
+"""gece - gece is kuyrugu. Yatmadan gorev koy, sabah taslaklari incele.
+
+Yalniz Python standart kutuphanesi. Komutlar: doctor, sablon, ekle, liste,
+calistir, ozet, goster, kabul, red, tekrar.  Ayrinti: README.md
+"""
+import argparse
+import fcntl
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+
+SURUM = "1.0"
+KOK = Path(os.environ.get("GECE_DIZIN") or Path(__file__).resolve().parent / "is-kutusu").expanduser()
+ISLER = KOK / "isler"
+GEREKLI = ["amac", "girdiler", "kabul olcutu", "yasaklar"]
+LIMIT_RE = re.compile(
+    r"usage limit|rate.?limit|quota|too many requests|\b429\b|limit reached|"
+    r"limit (?:will )?reset|try again (?:in|at|later)|overloaded|credit balance",
+    re.I,
+)
+ISCI_TAVAN = 2  # sert tavan: bilincli bir nedenin yoksa asma
+
+
+def ayar(ad, varsayilan):
+    ham = os.environ.get(ad)
+    if ham in (None, ""):
+        return varsayilan
+    try:
+        return type(varsayilan)(ham)
+    except ValueError:
+        sys.exit(f"{ad}={ham!r} gecersiz (beklenen: {type(varsayilan).__name__})")
+
+
+def simdi():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def sade(s):
+    """Basliklari Turkce karakterden bagimsiz karsilastir."""
+    s = s.replace("İ", "i").replace("I", "i").lower()
+    for a, b in zip("çğıöşü", "cgiosu"):
+        s = s.replace(a, b)
+    return s.strip(" :")
+
+
+# ---------------------------------------------------------------- brief
+def brief_ayristir(metin):
+    ust, govde = {}, metin
+    m = re.match(r"\A---\s*\n(.*?)\n---\s*\n?(.*)\Z", metin, re.S)
+    if m:
+        for satir in m.group(1).splitlines():
+            if ":" in satir and not satir.strip().startswith("#"):
+                k, v = satir.split(":", 1)
+                ust[sade(k)] = v.strip()
+        govde = m.group(2)
+    bolumler, baslik = {}, None
+    for satir in govde.splitlines():
+        h = re.match(r"##\s+(.+)", satir)
+        if h:
+            baslik = sade(h.group(1))
+            bolumler[baslik] = []
+        elif baslik:
+            bolumler[baslik].append(satir)
+    bolumler = {k: re.sub(r"<!--.*?-->", "", "\n".join(v), flags=re.S).strip() for k, v in bolumler.items()}
+    return ust, govde, bolumler
+
+
+def brief_dogrula(ust, bolumler):
+    hatalar = [f"'## {b}' bolumu yok ya da bos" for b in GEREKLI if not bolumler.get(b)]
+    if sade(ust.get("mod", "oku")) not in ("oku", "yaz"):
+        hatalar.append("mod: 'oku' ya da 'yaz' olmali")
+    if sade(ust.get("ajan", "")) not in ("", "claude", "codex", "ozel"):
+        hatalar.append("ajan: claude | codex | ozel")
+    try:
+        float(ust.get("sure", "30"))
+    except ValueError:
+        hatalar.append("sure: dakika cinsinden sayi olmali")
+    return hatalar
+
+
+# ---------------------------------------------------------------- durum
+def durum_oku(i):
+    return json.loads((ISLER / i / "durum.json").read_text())
+
+
+def durum_yaz(i, d):
+    p = ISLER / i / "durum.json"
+    gecici = p.with_suffix(".tmp")
+    gecici.write_text(json.dumps(d, ensure_ascii=False, indent=2))
+    os.replace(gecici, p)
+
+
+def durum_guncelle(i, **kw):
+    d = durum_oku(i)
+    d.update(kw)
+    durum_yaz(i, d)
+    return d
+
+
+def is_idleri():
+    if not ISLER.exists():
+        return []
+    return sorted(p.name for p in ISLER.iterdir() if (p / "durum.json").exists())
+
+
+def kimlik_coz(girdi):
+    tum = is_idleri()
+    if girdi in tum:
+        return girdi
+    adaylar = [i for i in tum if i.split("-", 1)[0] == girdi.zfill(3)]
+    if len(adaylar) == 1:
+        return adaylar[0]
+    sys.exit(f"is bulunamadi: {girdi}  (liste icin: gece liste)")
+
+
+def log(i, mesaj):
+    with open(ISLER / i / "log.txt", "a") as f:
+        f.write(f"[{simdi()}] {mesaj}\n")
+
+
+# ---------------------------------------------------------------- komutlar
+def cmd_sablon(a):
+    print((Path(__file__).resolve().parent / "ornekler" / "sablon-brief.md").read_text())
+
+
+def cmd_ekle(a):
+    kaynak = Path(a.brief).expanduser().resolve()
+    if not kaynak.is_file():
+        sys.exit(f"brief dosyasi yok: {kaynak}")
+    ust, govde, bol = brief_ayristir(kaynak.read_text())
+    hatalar = brief_dogrula(ust, bol)
+    klasor = Path(ust.get("klasor", ".") or ".").expanduser()
+    klasor = (klasor if klasor.is_absolute() else kaynak.parent / klasor).resolve()
+    if not klasor.is_dir():
+        hatalar.append(f"klasor yok: {klasor}")
+    elif klasor in (Path("/"), Path.home()):
+        hatalar.append("klasor olarak kok dizin ya da ev dizini verilemez; isin klasorunu daralt")
+    if hatalar:
+        print("Brief kuyruga ALINMADI:")
+        for h in hatalar:
+            print("  -", h)
+        sys.exit(1)
+    ISLER.mkdir(parents=True, exist_ok=True)
+    sira = len(is_idleri()) + 1
+    slug = re.sub(r"[^a-z0-9]+", "-", sade(ust.get("ad", kaynak.stem))).strip("-")[:40] or "is"
+    i = f"{sira:03d}-{slug}"
+    (ISLER / i / "cikti").mkdir(parents=True)
+    shutil.copy(kaynak, ISLER / i / "brief.md")
+    durum_yaz(i, {
+        "id": i, "ad": ust.get("ad", kaynak.stem), "durum": "bekliyor",
+        "ajan": sade(ust.get("ajan", "")) or os.environ.get("GECE_AJAN", "claude"),
+        "mod": sade(ust.get("mod", "oku")), "klasor": str(klasor),
+        "sure_dk": float(ust.get("sure", "30")), "izinler": ust.get("izinler", ""),
+        "kontrol": ust.get("kontrol", ""), "eklendi": simdi(), "deneme": 0, "not": "",
+    })
+    log(i, "kuyruga eklendi")
+    print(f"Kuyruga eklendi: {i}  (mod: {sade(ust.get('mod', 'oku'))}, klasor: {klasor})")
+
+
+def cmd_liste(a):
+    for i in is_idleri():
+        d = durum_oku(i)
+        print(f"{i:<34} {d['durum']:<14} {d['ajan']}/{d['mod']}")
+    if not is_idleri():
+        print("Kuyruk bos. Once: gece ekle BRIEF.md")
+
+
+def yuk():
+    try:
+        return os.getloadavg()[0]
+    except (OSError, AttributeError):
+        return 0.0
+
+
+def cmd_doctor(a):
+    print(f"gece {SURUM}   dizin: {KOK}")
+    print(f"yuk (1 dk): {yuk():.2f}   esik: {ayar('GECE_YUK_ESIK', 5.0)}   cekirdek: {os.cpu_count()}")
+    print(f"isci: {min(max(ayar('GECE_ISCI', 1), 1), ISCI_TAVAN)} (tavan {ISCI_TAVAN})   "
+          f"mola: {ayar('GECE_MOLA', 120.0)} sn   limit bekleme: {ayar('GECE_LIMIT_BEKLE', 1800.0)} sn")
+    ozel = os.environ.get("GECE_AJAN_KOMUT")
+    print(f"ozel ajan komutu: {ozel or '(yok)'}")
+    for ad, ikili in (("claude", ayar("GECE_CLAUDE", "claude")), ("codex", ayar("GECE_CODEX", "codex"))):
+        yol = shutil.which(ikili)
+        print(f"{ad:<7} {'bulundu: ' + yol if yol else 'YOK (kurulu degilse GECE_AJAN_KOMUT ile baska komut ver)'}")
+    for k in ("diff", "patch", "python3"):
+        print(f"{k:<7} {'ok' if shutil.which(k) else 'YOK'}")
+    sys.exit(0)
+
+
+def ajan_komutu(d, cwd, prompt_dosya):
+    """(komut, shell_mi) dondurur. Prompt stdin'den gider."""
+    ozel = os.environ.get("GECE_AJAN_KOMUT")
+    if ozel:
+        return ozel, True
+    yaz = d["mod"] == "yaz"
+    if d["ajan"] == "claude":
+        araclar = "Read,Glob,Grep" + (",Write,Edit" if yaz else "")
+        if d["izinler"]:
+            araclar += "," + d["izinler"]
+        return [ayar("GECE_CLAUDE", "claude"), "-p", "--allowedTools", araclar], False
+    if d["ajan"] == "codex":
+        return [ayar("GECE_CODEX", "codex"), "exec", "-s", "workspace-write" if yaz else "read-only",
+                "-C", str(cwd), "--skip-git-repo-check", "-"], False
+    sys.exit("ajan 'ozel' icin GECE_AJAN_KOMUT ortam degiskeni gerekli")
+
+
+KURALLAR = """GECE KURALLARI (degismez, brief'ten once gelir)
+- Bu oturum gozetimsiz. Ciktin TASLAKTIR; sabah bir insan inceleyip kabul ya da red eder.
+- Disariya hicbir sey gonderme: e-posta, mesaj, yayin, odeme, form, disa yazan API cagrisi,
+  git push, deploy YOK. Brief istese bile yapma; sonucta "yapmadim: <ne>" yaz.
+- Yalniz calisma klasorunde calis. Disina cikma. Anahtar, sifre, .env, token dosyalarini okuma
+  ve ciktiya koyma.
+- Emin degilsen uydurma: "bilmiyorum" ya da "dogrulanamadi" yaz.
+- Brief'teki KABUL OLCUTUNE gore kendini kontrol et; karsilamiyorsan hangi madde eksik, soyle.
+{mod}
+
+--- BRIEF ---
+{brief}
+"""
+MOD_OKU = "- Mod: SALT-OKUNUR. Hicbir dosyayi degistirme. Sonucu cevap olarak, tam metin yaz (sistem sonuc.md'ye kaydeder)."
+MOD_YAZ = ("- Mod: YAZAR, ama calisma klasoru bir KOPYA; orijinal etkilenmez. Dosyalari degistirebilirsin. "
+           "Sonda ne yaptigini ve neyi test ettigini cevap olarak ozetle.")
+
+
+def kopyala(kaynak, hedef):
+    toplam = 0
+    sinir = ayar("GECE_KOPYA_MB", 500.0) * 1e6
+    for yol, _, dosyalar in os.walk(kaynak):
+        for f in dosyalar:
+            try:
+                toplam += os.path.getsize(os.path.join(yol, f))
+            except OSError:
+                pass
+        if toplam > sinir:
+            raise RuntimeError(f"klasor {sinir/1e6:.0f} MB'tan buyuk; isi kucuk bir klasorle sinirla (GECE_KOPYA_MB)")
+    yoksay = shutil.ignore_patterns(".git", "node_modules", "__pycache__", ".venv", "*.pyc", ".env", ".env.*")
+    shutil.copytree(kaynak, hedef, ignore=yoksay, symlinks=True)
+
+
+def alt_surec(komut, shell, cwd, girdi, zaman_asimi, env):
+    p = subprocess.Popen(komut, shell=shell, cwd=cwd, env=env, stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    try:
+        out, err = p.communicate(girdi, timeout=zaman_asimi)
+        return p.returncode, out, err, False
+    except subprocess.TimeoutExpired:
+        for sinyal, bekle in ((signal.SIGTERM, 5), (signal.SIGKILL, 5)):
+            try:
+                os.killpg(p.pid, sinyal)
+            except ProcessLookupError:
+                break
+            try:
+                out, err = p.communicate(timeout=bekle)
+                break
+            except subprocess.TimeoutExpired:
+                out = err = ""
+        return -9, out or "", err or "", True
+
+
+def is_calistir(i, dur):
+    """Tek isi bitirir. dur: threading.Event (sure doldu / durdur). Durumu isler."""
+    d = durum_oku(i)
+    jd = ISLER / i
+    cikti = jd / "cikti"
+    yaz = d["mod"] == "yaz"
+    try:
+        if yaz and not (jd / "b").exists():
+            kopyala(d["klasor"], jd / "a")
+            kopyala(d["klasor"], jd / "b")
+        cwd = jd / "b" if yaz else Path(d["klasor"])
+        brief = (jd / "brief.md").read_text()
+        prompt = KURALLAR.format(mod=MOD_YAZ if yaz else MOD_OKU, brief=brief)
+        (jd / "prompt.txt").write_text(prompt)
+    except Exception as e:  # kopya/okuma hatasi
+        durum_guncelle(i, durum="hata", **{"not": f"hazirlik: {e}"})
+        log(i, f"hazirlik hatasi: {e}")
+        return
+    try:
+        komut, shell = ajan_komutu(d, cwd, jd / "prompt.txt")
+    except SystemExit as e:
+        durum_guncelle(i, durum="hata", **{"not": str(e)})
+        return
+    env = dict(os.environ, GECE_IS_ID=i, GECE_IS_DIZIN=str(jd), CIKTI_KLASORU=str(cikti),
+               CALISMA_KLASORU=str(cwd), GECE_MOD=d["mod"], BRIEF_DOSYA=str(jd / "brief.md"),
+               PROMPT_DOSYA=str(jd / "prompt.txt"))
+    limit_deneme = ayar("GECE_LIMIT_DENEME", 8)
+    bekle = ayar("GECE_LIMIT_BEKLE", 1800.0)
+    for deneme in range(1, limit_deneme + 2):
+        t0 = time.monotonic()
+        durum_guncelle(i, durum="calisiyor", deneme=d["deneme"] + deneme, basladi=simdi())
+        log(i, f"basladi (deneme {deneme}) komut: {komut if shell else ' '.join(komut)}")
+        try:
+            rc, out, err, zaman_asimi = alt_surec(komut, shell, cwd, prompt, d["sure_dk"] * 60, env)
+        except FileNotFoundError as e:
+            durum_guncelle(i, durum="hata", **{"not": f"ajan komutu bulunamadi: {e.filename}"})
+            log(i, f"komut yok: {e}")
+            return
+        sure = time.monotonic() - t0
+        with open(jd / "log.txt", "a") as f:
+            f.write(f"--- stdout ---\n{out}\n--- stderr ---\n{err}\n--- cikis: {rc}  sure: {sure:.0f}s ---\n")
+        if zaman_asimi:
+            durum_guncelle(i, durum="zaman_asimi", sure_sn=round(sure), **{"not": f"{d['sure_dk']:g} dk sinirini asti, durduruldu"})
+            return
+        if rc != 0 and LIMIT_RE.search(out[-2000:] + err[-2000:]):
+            if deneme > limit_deneme:
+                durum_guncelle(i, durum="bekliyor", **{"not": f"limit {limit_deneme} kez bekletti; sonraki calistirmada denenir"})
+                return
+            durum_guncelle(i, durum="limit_bekliyor", **{"not": f"limit doldu, {bekle:g} sn sonra devam ({deneme}/{limit_deneme})"})
+            log(i, f"limit/kota sinyali; {bekle:g} sn bekleniyor")
+            if dur.wait(bekle):  # sure doldu: isi sonraki geceye birak
+                durum_guncelle(i, durum="bekliyor", **{"not": "limit beklerken sure doldu; sonraki calistirmada devam"})
+                return
+            continue
+        if rc != 0:
+            durum_guncelle(i, durum="hata", sure_sn=round(sure), **{"not": f"ajan {rc} koduyla cikti (log.txt)"})
+            return
+        if not out.strip():
+            durum_guncelle(i, durum="hata", sure_sn=round(sure), **{"not": "ajan bos cikti verdi"})
+            return
+        (cikti / "sonuc.md").write_text(out)
+        if yaz:
+            fark = subprocess.run(["diff", "-ruN", "a", "b"], cwd=jd, capture_output=True, text=True).stdout
+            (cikti / "degisiklik.diff").write_text(fark)
+        kontrol = "yok"
+        if d["kontrol"]:
+            try:
+                r = subprocess.run(d["kontrol"], shell=True, cwd=cikti, env=env, capture_output=True, text=True, timeout=120)
+                kontrol = "gecti" if r.returncode == 0 else "KALDI"
+                log(i, f"otomatik kontrol: {kontrol}\n{r.stdout[-800:]}{r.stderr[-800:]}")
+            except subprocess.TimeoutExpired:
+                kontrol = "KALDI"
+                log(i, "otomatik kontrol zaman asimi")
+        durum_guncelle(i, durum="taslak", sure_sn=round(sure), kontrol=kontrol, bitti=simdi(), **{"not": ""})
+        log(i, f"taslak hazir ({sure:.0f} sn, kontrol: {kontrol})")
+        return
+
+
+def cmd_calistir(a):
+    ISLER.mkdir(parents=True, exist_ok=True)
+    kilit = open(KOK / ".kilit", "w")
+    try:
+        fcntl.flock(kilit, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit("baska bir 'gece calistir' zaten calisiyor; ikincisi baslatilmadi.")
+    for i in is_idleri():  # onceki calistirma olduyse yarim kalan isleri geri al
+        if durum_oku(i)["durum"] in ("calisiyor", "limit_bekliyor"):
+            durum_guncelle(i, durum="bekliyor", **{"not": "onceki calistirma yarida kesildi; yeniden denenecek"})
+    isci = ayar("GECE_ISCI", 1)
+    if isci > ISCI_TAVAN:
+        print(f"UYARI: GECE_ISCI={isci} istendi, tavan {ISCI_TAVAN}; {ISCI_TAVAN} kullaniliyor.")
+    isci = min(max(isci, 1), ISCI_TAVAN)
+    sure = a.sure if a.sure is not None else ayar("GECE_SURE", 8 * 3600.0)
+    bitis = time.monotonic() + sure
+    mola, esik, yuk_bekle = ayar("GECE_MOLA", 120.0), ayar("GECE_YUK_ESIK", 5.0), ayar("GECE_YUK_BEKLE", 600.0)
+    kuyruk = [i for i in is_idleri() if durum_oku(i)["durum"] == "bekliyor"]
+    t_basla = simdi()
+    sonuc = {"basladi": t_basla, "bitti": None, "isci": isci, "islenen": 0, "durdu": ""}
+    print(f"[{t_basla}] {len(kuyruk)} is, {isci} isci, sure siniri {sure:g} sn, yuk esigi {esik}")
+    sira, sira_kilit, dur = list(kuyruk), threading.Lock(), threading.Event()
+    sayac = {"n": 0}
+
+    def zamanlayici():
+        if not dur.wait(max(0, bitis - time.monotonic())):
+            sonuc["durdu"] = sonuc["durdu"] or "sure doldu"
+            dur.set()
+    threading.Thread(target=zamanlayici, daemon=True).start()
+
+    def isci_dongusu(no):
+        ilk = True
+        while not dur.is_set():
+            if not ilk:
+                with sira_kilit:
+                    if not sira:  # kuyruk bitti, bosuna mola yok
+                        return
+                if dur.wait(mola):  # isler arasi mola
+                    return
+            ilk = False
+            bekleme = time.monotonic()
+            while yuk() > esik:  # makine mesgulse baslama
+                if time.monotonic() - bekleme > yuk_bekle:
+                    sonuc["durdu"] = f"makine yuku {yuk():.1f} > {esik} ({yuk_bekle:g} sn beklendi)"
+                    dur.set()
+                    return
+                if dur.wait(min(5.0, max(0.2, yuk_bekle / 10))):
+                    return
+            with sira_kilit:
+                if not sira:
+                    return
+                i = sira.pop(0)
+            print(f"[{simdi()}] isci{no}: {i} basliyor")
+            is_calistir(i, dur)
+            sayac["n"] += 1
+            print(f"[{simdi()}] isci{no}: {i} -> {durum_oku(i)['durum']}")
+
+    isciler = [threading.Thread(target=isci_dongusu, args=(n + 1,)) for n in range(isci)]
+    try:
+        for t in isciler:
+            t.start()
+        for t in isciler:
+            t.join()
+    except KeyboardInterrupt:
+        dur.set()
+        print("durduruluyor...")
+    dur.set()
+    sonuc.update(bitti=simdi(), islenen=sayac["n"])
+    (KOK / "son-calistirma.json").write_text(json.dumps(sonuc, ensure_ascii=False, indent=2))
+    print(f"[{simdi()}] bitti: {sayac['n']} is islendi." + (f" Durma nedeni: {sonuc['durdu']}." if sonuc["durdu"] else ""))
+    print("Sabah icin: gece ozet")
+
+
+ETIKET = {"taslak": "TASLAK", "bekliyor": "BEKLIYOR", "limit_bekliyor": "LIMIT", "calisiyor": "CALISIYOR",
+          "hata": "HATA", "zaman_asimi": "ZAMAN ASIMI", "kabul": "KABUL", "red": "RED"}
+
+
+def cmd_ozet(a):
+    idler = is_idleri()
+    gruplar = {"taslak": [], "kalan": [], "sorun": [], "kapali": []}
+    for i in idler:
+        d = durum_oku(i)
+        gruplar[{"taslak": "taslak", "bekliyor": "kalan", "calisiyor": "kalan", "limit_bekliyor": "kalan",
+                 "hata": "sorun", "zaman_asimi": "sorun", "kabul": "kapali", "red": "kapali"}[d["durum"]]].append(d)
+    son = KOK / "son-calistirma.json"
+    ust = f"GECE OZETI  {simdi()[:16]}"
+    if son.exists():
+        s = json.loads(son.read_text())
+        ust += f"   son calistirma: {s['basladi'][5:16]} -> {(s['bitti'] or '?')[5:16]}, {s['islenen']} is"
+        if s.get("durdu"):
+            ust += f" ({s['durdu']})"
+    print(ust)
+    print("=" * 78)
+
+    def satir(d, ek=""):
+        sn = d.get("sure_sn")
+        sure = f"{sn // 60}dk{sn % 60:02d}" if sn is not None else "-"
+        print(f"  {d['id']:<30} {sure:>7}  {ek}{d['not'] or ''}")
+
+    print(f"TASLAK - inceleme bekliyor ({len(gruplar['taslak'])})")
+    for d in gruplar["taslak"]:
+        satir(d, f"kontrol:{d.get('kontrol', '-')}  ")
+    print(f"KALDI - henuz calismadi / yarida ({len(gruplar['kalan'])})")
+    for d in gruplar["kalan"]:
+        satir(d, f"[{ETIKET[d['durum']]}] ")
+    print(f"SORUNLU ({len(gruplar['sorun'])})")
+    for d in gruplar["sorun"]:
+        satir(d, f"[{ETIKET[d['durum']]}] ")
+    k = gruplar["kapali"]
+    print(f"KAPANAN: {sum(d['durum'] == 'kabul' for d in k)} kabul, {sum(d['durum'] == 'red' for d in k)} red")
+    print("-" * 78)
+    print("Taslagi gor: gece goster ID   |   gece kabul ID   |   gece red ID --not \"neden\"   |   gece tekrar ID")
+    print("Hatirlatma: cikti TASLAKTIR. Kabul etmeden once cikti klasorundeki dosyayi kendin oku.")
+
+
+def cmd_goster(a):
+    i = kimlik_coz(a.id)
+    d = durum_oku(i)
+    jd = ISLER / i
+    print(f"{i}  [{d['durum']}]  {d['ajan']}/{d['mod']}  kontrol: {d.get('kontrol', '-')}")
+    if d["not"]:
+        print("not:", d["not"])
+    print(f"klasor: {jd}/cikti/")
+    sonuc = jd / "cikti" / "sonuc.md"
+    if sonuc.exists():
+        print("\n----- sonuc.md -----")
+        print(sonuc.read_text())
+    fark = jd / "cikti" / "degisiklik.diff"
+    if fark.exists():
+        satirlar = fark.read_text().splitlines()
+        print(f"\n----- degisiklik.diff ({len(satirlar)} satir) -----")
+        print("\n".join(satirlar[:120]))
+        print(f"\nUygulamak icin (kabul ettiysen):\n  cd {d['klasor']} && patch -p1 < {fark}")
+    if d["durum"] in ("hata", "zaman_asimi"):
+        print("\n----- log.txt (son 40 satir) -----")
+        print("\n".join((jd / "log.txt").read_text().splitlines()[-40:]))
+
+
+def cmd_kabul(a):
+    i = kimlik_coz(a.id)
+    d = durum_oku(i)
+    if d["durum"] != "taslak":
+        sys.exit(f"yalniz 'taslak' kabul edilir (simdi: {d['durum']})")
+    durum_guncelle(i, durum="kabul", **{"not": a.not_ or ""})
+    log(i, f"KABUL {a.not_ or ''}")
+    print(f"{i} kabul edildi.")
+    if d["mod"] == "yaz":
+        print(f"Degisiklik otomatik UYGULANMAZ. Uygulamak icin: gece goster {i}")
+
+
+def cmd_red(a):
+    i = kimlik_coz(a.id)
+    d = durum_oku(i)
+    if d["durum"] != "taslak":
+        sys.exit(f"yalniz 'taslak' reddedilir (simdi: {d['durum']})")
+    if not a.not_:
+        sys.exit("red icin --not ile gerekce yaz (sonraki brief'i iyilestirir)")
+    durum_guncelle(i, durum="red", **{"not": a.not_})
+    log(i, f"RED {a.not_}")
+    print(f"{i} reddedildi. Brief'i duzeltip yeniden ekle ya da: gece tekrar {i}")
+
+
+def cmd_tekrar(a):
+    i = kimlik_coz(a.id)
+    d = durum_oku(i)
+    if d["durum"] not in ("hata", "zaman_asimi", "red", "bekliyor"):
+        sys.exit(f"tekrar yalniz hata/zaman_asimi/red icin (simdi: {d['durum']})")
+    durum_guncelle(i, durum="bekliyor", **{"not": "tekrar kuyruga alindi"})
+    print(f"{i} tekrar kuyrukta.")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="gece", description="Gece is kuyrugu")
+    s = p.add_subparsers(dest="komut", required=True)
+    s.add_parser("doctor").set_defaults(f=cmd_doctor)
+    s.add_parser("sablon").set_defaults(f=cmd_sablon)
+    s.add_parser("liste").set_defaults(f=cmd_liste)
+    s.add_parser("ozet").set_defaults(f=cmd_ozet)
+    x = s.add_parser("ekle"); x.add_argument("brief"); x.set_defaults(f=cmd_ekle)
+    x = s.add_parser("calistir"); x.add_argument("--sure", type=float, help="saniye; bu sureden sonra yeni is baslamaz"); x.set_defaults(f=cmd_calistir)
+    x = s.add_parser("goster"); x.add_argument("id"); x.set_defaults(f=cmd_goster)
+    x = s.add_parser("kabul"); x.add_argument("id"); x.add_argument("--not", dest="not_"); x.set_defaults(f=cmd_kabul)
+    x = s.add_parser("red"); x.add_argument("id"); x.add_argument("--not", dest="not_"); x.set_defaults(f=cmd_red)
+    x = s.add_parser("tekrar"); x.add_argument("id"); x.set_defaults(f=cmd_tekrar)
+    a = p.parse_args()
+    a.f(a)
+
+
+if __name__ == "__main__":
+    main()

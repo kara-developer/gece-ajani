@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- macOS launchd. KULLANICI ve yolları değiştir, sonra:
+       cp gece-ajani.plist.ornek ~/Library/LaunchAgents/com.kara-developer.gece-ajani.plist
+       launchctl load ~/Library/LaunchAgents/com.kara-developer.gece-ajani.plist
+     Mac'in uyumaması için caffeinate kullanılır; kapağı kapatırsan çalışmaz (prize tak, kapağı açık bırak). -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.kara-developer.gece-ajani</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/caffeinate</string>
+    <string>-i</string>
+    <string>/Users/KULLANICI/gece-ajani/gece</string>
+    <string>calistir</string>
+    <string>--sure</string>
+    <string>21600</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/Users/KULLANICI/.local/bin</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>23</integer><key>Minute</key><integer>30</integer></dict>
+  <key>StandardOutPath</key><string>/Users/KULLANICI/gece-ajani/is-kutusu/launchd.log</string>
+  <key>StandardErrorPath</key><string>/Users/KULLANICI/gece-ajani/is-kutusu/launchd.log</string>
+</dict>
+</plist>

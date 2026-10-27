@@ -1,0 +1,5 @@
+# Linux (veya macOS) cron. `crontab -e` ile ekle. Yolları kendine göre değiştir.
+# Her gece 23:30'da başlar, en fazla 6 saat (21600 sn) çalışır; yeni iş o süreden sonra başlamaz.
+# cron'un PATH'i boştur: claude/codex'in bulunduğu klasörü yaz (`which claude`).
+PATH=/usr/local/bin:/usr/bin:/bin:/home/KULLANICI/.local/bin
+30 23 * * * /home/KULLANICI/gece-ajani/gece calistir --sure 21600 >> /home/KULLANICI/gece-ajani/is-kutusu/cron.log 2>&1
